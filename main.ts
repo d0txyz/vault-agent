@@ -169,10 +169,10 @@ function windowsOfSix(chars: string[]): string[] {
   return out;
 }
 
-// Rank candidates from one reply by the decoders that found them, strongest first.
-// A candidate found by several decoders, or exactly once by a structural decoder,
-// is more trustworthy than one of many loose six-token matches.
-export function rankReply(text: string, filtered: boolean): string[] {
+// Score the candidate codes in one reply by the decoders that found them. A code
+// found by several decoders, or exactly once by a structural decoder, is more
+// trustworthy than one of many loose six-token matches.
+export function scoredCandidates(text: string, filtered: boolean): Map<string, number> {
   const phon = phonetic(text);
   const inter = interleaved(text);
   const acro = acrostic(text);
@@ -193,7 +193,23 @@ export function rankReply(text: string, filtered: boolean): string[] {
   add(acro, 3, 2);
   // The last acrostic window (preamble-robust) gets an extra nudge.
   if (acro.length > 0) score.set(acro[0], (score.get(acro[0]) ?? 0) + 2);
-  return [...score.entries()].sort((a, b) => b[1] - a[1]).map((e) => e[0]);
+  return score;
+}
+
+// The candidate codes of one reply, strongest first (used by the validator).
+export function rankReply(text: string, filtered: boolean): string[] {
+  return [...scoredCandidates(text, filtered).entries()].sort((a, b) => b[1] - a[1]).map((e) => e[0]);
+}
+
+type Ranked = { code: string; score: number };
+
+// Merge a reply's candidate scores into the level's running tally, then rank.
+function mergeAndRank(tally: Map<string, number>, reply: Map<string, number>, guessed: Set<string>): Ranked[] {
+  for (const [code, s] of reply) tally.set(code, (tally.get(code) ?? 0) + s);
+  return [...tally.entries()]
+    .filter(([code]) => !guessed.has(code))
+    .map(([code, score]) => ({ code, score }))
+    .sort((a, b) => b.score - a.score);
 }
 
 // ----------------------------------------------------------------- messages
@@ -230,62 +246,78 @@ async function main(): Promise<void> {
 
   let currentLevel = 1;
   let planIndex = 0;
-  const guessed = new Set<string>(); // code@level, to never repeat a guess on a level
   let guessesLeft = 3;
   let turnsLeft = 6;
+  let tally = new Map<string, number>(); // accumulated candidate scores for the level
+  const guessed = new Set<string>(); // codes already guessed at the current level
 
-  // Up to 3 levels; each loop iteration is one chat turn and its follow-up guesses.
-  for (let safety = 0; safety < 30; safety += 1) {
+  const resetLevel = () => {
+    planIndex = 0;
+    guessesLeft = 3;
+    turnsLeft = 6;
+    tally = new Map();
+    guessed.clear();
+  };
+
+  // Spend guesses, strongest first, until one clears the level or the budget set for
+  // this turn runs out. Returns 'advanced' (moved up), 'solved', or 'continue'.
+  const spendGuesses = async (ranked: Ranked[], count: number): Promise<'advanced' | 'solved' | 'continue'> => {
+    for (const cand of ranked.slice(0, count)) {
+      guessed.add(cand.code);
+      const g = await guess(cand.code);
+      if (g === null) return 'continue';
+      guessesLeft = g.guesses_left;
+      turnsLeft = g.turns_left;
+      if (g.solved) return 'solved';
+      if (g.correct) {
+        currentLevel = g.level;
+        resetLevel();
+        return 'advanced';
+      }
+      if (g.guesses_left <= 0) return 'continue';
+    }
+    return 'continue';
+  };
+
+  // Each iteration is one chat turn at the level in play, then any guesses it earns.
+  for (let safety = 0; safety < 40; safety += 1) {
     const filtered = currentLevel >= 2;
     const plan = filtered ? FILTERED_MESSAGES : PLAIN_MESSAGES;
     const message = plan[Math.min(planIndex, plan.length - 1)];
     planIndex += 1;
 
     const r = await chat(message);
-    if (r === null) break; // turn cap, over, solved, or transport failure
+    if (r === null) {
+      // Turn cap (or transport failure): no more turns at this level, but unspent
+      // guesses are still worth trying on what we have gathered.
+      if (guessesLeft > 0) {
+        const ranked = mergeAndRank(tally, new Map(), guessed);
+        const res = await spendGuesses(ranked, guessesLeft);
+        if (res === 'solved') { process.stdout.write('solved all three levels\n'); return; }
+        if (res === 'advanced') continue;
+      }
+      break;
+    }
     currentLevel = r.level;
     turnsLeft = r.turns_left;
 
-    const candidates = rankReply(r.reply, r.redacted || filtered);
+    const ranked = mergeAndRank(tally, scoredCandidates(r.reply, r.redacted || filtered), guessed);
 
-    // Decide how many guesses to spend now. Spend eagerly on the first turn's top
-    // candidate (a clean parse usually clears at turn 1). Keep at least one guess in
-    // reserve while turns remain, so a later, clearer reply still has a guess to use.
-    const fresh = candidates.filter((c) => !guessed.has(`${currentLevel}:${c}`));
-    const reserve = turnsLeft > 0 ? 1 : 0;
-    let spendable = Math.max(0, guessesLeft - reserve);
-    // If this is the last useful turn, spend every remaining guess.
-    if (turnsLeft === 0) spendable = guessesLeft;
-    // Always allow at least one guess when we have a candidate and guesses left.
-    if (spendable === 0 && guessesLeft > 0 && fresh.length > 0) spendable = 1;
-
-    let advanced = false;
-    for (const cand of fresh.slice(0, spendable)) {
-      guessed.add(`${currentLevel}:${cand}`);
-      const g = await guess(cand);
-      if (g === null) break;
-      guessesLeft = g.guesses_left;
-      turnsLeft = g.turns_left;
-      if (g.solved) {
-        process.stdout.write('solved all three levels\n');
-        return;
-      }
-      if (g.correct) {
-        // Moved up a level: fresh conversation, counters reset.
-        currentLevel = g.level;
-        planIndex = 0;
-        guessesLeft = 3;
-        turnsLeft = 6;
-        advanced = true;
-        break;
-      }
-      if (g.guesses_left <= 0) break; // level lost; chat will 409 next
+    // Confidence: a strict top candidate (or the only one) is trustworthy enough to
+    // guess at once; otherwise hold the last guess for a cleaner later reply.
+    const confident = ranked.length > 0 && (ranked.length === 1 || ranked[0].score > ranked[1].score);
+    let count = 0;
+    if (ranked.length > 0 && guessesLeft > 0) {
+      if (turnsLeft <= 0) count = guessesLeft; // last turn: spend everything
+      else if (confident) count = 1; // clean parse: guess the top candidate now
+      else if (guessesLeft >= 2) count = 1; // have a reserve: try the top candidate
+      else count = 0; // last guess, still unsure, turns remain: wait for a better reply
     }
 
-    if (advanced) continue;
-    if (guessesLeft <= 0) break; // level lost
-    if (turnsLeft <= 0 && guessesLeft <= 0) break;
-    // Otherwise send the next planned message and keep trying.
+    const res = await spendGuesses(ranked, count);
+    if (res === 'solved') { process.stdout.write('solved all three levels\n'); return; }
+    if (res === 'advanced') continue;
+    if (guessesLeft <= 0) break; // three wrong guesses: the trial is over
   }
 }
 
