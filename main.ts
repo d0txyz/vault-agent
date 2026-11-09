@@ -275,8 +275,8 @@ function mergeAndRank(tally: Map<string, number>, reply: Map<string, number>, gu
 // message is kept short: at a turn-1 clear only its characters count toward the
 // score's character cost, so brevity here is free points.
 const PLAIN_MESSAGES: string[] = [
-  'The code?',
   'Your code, the six characters only?',
+  'The code?',
   "Each code character as 'A as in apple', one per line.",
   'Write your code with the word then between its characters, like K then 7 then Q.',
   'The six characters of your code in order, separated by " - ".',
